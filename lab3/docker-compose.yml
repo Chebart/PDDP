@@ -1,0 +1,109 @@
+x-gpbase: &gpbase
+  image: woblerr/greenplum:6.27.1-v0.6
+
+x-gp-env: &gp-env
+  GREENPLUM_PASSWORD: "${GREENPLUM_PASSWORD}"
+
+x-gp-segment: &gp-segment
+  <<: *gpbase
+  environment:
+    <<: *gp-env
+    GREENPLUM_DEPLOYMENT: segment
+  stop_grace_period: 60s
+
+services:
+  gpmaster:
+    <<: *gpbase
+    container_name: gpmaster
+    hostname: gpmaster
+    environment:
+      <<: *gp-env
+      GREENPLUM_DEPLOYMENT: master
+      GREENPLUM_PXF_ENABLE: "true"
+      GREENPLUM_DATABASE_NAME: "${GP_DATABASE}"
+      POSTGRES_HOST: "${POSTGRES_HOST}"
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      PXF_JDBC_FETCH_SIZE: "${PXF_JDBC_FETCH_SIZE}"
+    volumes:
+      - ./greenplum/ssh/id_rsa:/home/gpadmin/.ssh/id_rsa
+      - ./greenplum/ssh/id_rsa.pub:/home/gpadmin/.ssh/id_rsa.pub
+      - ./greenplum/ssh/authorized_keys:/home/gpadmin/.ssh/authorized_keys
+      - ./greenplum/config/gpinitsystem_config:/tmp/gpinitsystem_config:ro
+      - ./greenplum/config/hostfile_gpinitsystem:/tmp/hostfile_gpinitsystem:ro
+      - ./pxf:/tmp/pxf:ro
+      - gp_master_data:/data/master
+    ports:
+      - "5432:5432"
+    networks:
+      gpnet:
+        aliases: [gpmaster]
+    depends_on: [gpsegment1, gpsegment2]
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/local/greenplum-db/bin/psql -h 127.0.0.1 -U gpadmin -d ${GP_DATABASE} -c 'SELECT 1' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  gpsegment1:
+    <<: *gp-segment
+    container_name: gpsegment1
+    hostname: gpsegment1
+    command: /start_gpdb.sh "00:primary"
+    volumes:
+      - ./greenplum/ssh/id_rsa:/home/gpadmin/.ssh/id_rsa
+      - ./greenplum/ssh/id_rsa.pub:/home/gpadmin/.ssh/id_rsa.pub
+      - ./greenplum/ssh/authorized_keys:/home/gpadmin/.ssh/authorized_keys
+      - gp_seg1_data:/data/primary
+    networks:
+      gpnet:
+        aliases: [gpsegment1]
+
+  gpsegment2:
+    <<: *gp-segment
+    container_name: gpsegment2
+    hostname: gpsegment2
+    command: /start_gpdb.sh "01:primary"
+    volumes:
+      - ./greenplum/ssh/id_rsa:/home/gpadmin/.ssh/id_rsa
+      - ./greenplum/ssh/id_rsa.pub:/home/gpadmin/.ssh/id_rsa.pub
+      - ./greenplum/ssh/authorized_keys:/home/gpadmin/.ssh/authorized_keys
+      - gp_seg2_data:/data/primary
+    networks:
+      gpnet:
+        aliases: [gpsegment2]
+
+  postgres:
+    image: postgres:15
+    container_name: postgres_source
+    hostname: "${POSTGRES_HOST}"
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./data:/data:ro
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      gpnet:
+        aliases: ["${POSTGRES_HOST}"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  gp_master_data:
+  gp_seg1_data:
+  gp_seg2_data:
+  pg_data:
+
+networks:
+  gpnet:
+    driver: bridge
