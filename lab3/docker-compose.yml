@@ -75,6 +75,25 @@ services:
       gpnet:
         aliases: [gpsegment2]
 
+  gpfdist:
+    build:
+      context: ./gpfdist
+      dockerfile: Dockerfile
+    container_name: gpfdist
+    hostname: gpfdist
+    volumes:
+      - ./data:/data/csv:ro
+    ports:
+      - "${GPFDIST_PORT}:8080"
+    networks:
+      gpnet:
+        aliases: [gpfdist]
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep gpfdist > /dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
   postgres:
     image: postgres:15
     container_name: postgres_source

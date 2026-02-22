@@ -9,13 +9,13 @@ PSQL="docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpa
 
 step() { echo; echo "── $* ──────────────────────────────────────"; }
 
-step "1/3  Downloading dataset"
+step "1/4  Downloading dataset"
 ./scripts/download_data.sh
 
-step "2/3  SSH keys"
+step "2/4  SSH keys"
 ./scripts/generate_ssh_keys.sh
 
-step "3/3  Starting containers"
+step "3/4  Starting containers"
 docker compose up -d postgres gpsegment1 gpsegment2
 
 echo "Waiting for Postgres to be ready..."
@@ -43,6 +43,17 @@ docker exec -u root gpmaster bash /tmp/setup_pxf.sh
 
 $PSQL < sql/pxf_external_tables.sql
 $PSQL < sql/gp_tables.sql
+
+step "4/4  Starting gpfdist"
+docker compose up -d gpfdist
+
+echo "Waiting for gpfdist to be ready..."
+until docker exec gpfdist pgrep gpfdist &>/dev/null; do
+    sleep 3
+done
+echo "gpfdist is ready."
+
+$PSQL < sql/gpfdist_external_table.sql
 
 echo
 echo "Configuration step is done!"
