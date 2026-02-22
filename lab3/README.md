@@ -158,8 +158,8 @@ FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import');
 `sql/gp_tables.sql` создаёт нативные GP-таблицы с ключами дистрибьюции v1 и сразу загружает данные через `INSERT INTO ... SELECT * FROM ext_*`.
 
 ```bash
-docker exec -i gpmaster psql -U gpadmin -d toystore < sql/pxf_external_tables.sql
-docker exec -i gpmaster psql -U gpadmin -d toystore < sql/gp_tables.sql
+docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -d toystore < sql/pxf_external_tables.sql
+docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -d toystore < sql/gp_tables.sql
 ```
 
 ---
@@ -181,7 +181,7 @@ docker exec -i gpmaster psql -U gpadmin -d toystore < sql/gp_tables.sql
 
 ```bash
 # Распределение строк и коэффициент skew по всем таблицам:
-docker exec -i gpmaster psql -U gpadmin -d toystore < sql/distribution_analysis.sql
+docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -d toystore < sql/distribution_analysis.sql
 
 # Построить гистограммы до перераспределения (запускается на хосте из venv):
 python3 plots/distribution_analysis.py v1
@@ -291,7 +291,7 @@ ORDER BY refund_rate_pct DESC NULLS LAST;
 - `order_item_refunds`: `order_item_id` → `order_id`
 
 ```bash
-docker exec -i gpmaster psql -U gpadmin -d toystore < sql/redistribution.sql
+docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -d toystore < sql/redistribution.sql
 ```
 
 ### Изменения в планах запросов (v2)
@@ -318,10 +318,10 @@ docker exec -i gpmaster psql -U gpadmin -d toystore < sql/redistribution.sql
 
 ```bash
 # Планы v1 (до перераспределения):
-docker exec -i gpmaster psql -U gpadmin -d toystore < sql/queries_v1.sql
+docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -d toystore < sql/queries_v1.sql
 
 # Планы v2 (после перераспределения):
-docker exec -i gpmaster psql -U gpadmin -d toystore < sql/queries_v2.sql
+docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -d toystore < sql/queries_v2.sql
 
 # Графики после перераспределения:
 python3 plots/distribution_analysis.py v2
@@ -352,26 +352,18 @@ python3 plots/distribution_analysis.py v2
 
 gpfdist — встроенный HTTP-сервер Greenplum для параллельной раздачи файлов. Каждый сегмент подключается к gpfdist напрямую и вытягивает свою часть CSV одновременно — значительно быстрее JDBC при bulk load: нет накладных расходов JDBC, нет узкого места в виде одного потока.
 
-gpfdist запускается внутри контейнера `gpmaster`, поскольку бинарник входит в состав дистрибутива Greenplum. CSV-файлы копируются из `data/` в контейнер перед запуском.
+gpfdist работает как отдельный контейнер в той же Docker-сети `gpnet`. CSV-файлы монтируются из `./data/` хоста в `/data/csv` контейнера в режиме read-only. Образ собирается из `gpfdist/Dockerfile` на базе `woblerr/greenplum:6.27.1`, который уже содержит бинарник `gpfdist`. `setup.sh` запускает контейнер автоматически на шаге 4/4 и ждёт готовности через healthcheck.
 
-### Запуск
+### Проверка
 
 ```bash
-# Скопировать CSV-файлы в контейнер:
-docker cp data/. gpmaster:/tmp/csv/
-
-# Запустить gpfdist внутри gpmaster в фоне:
-docker exec -d gpmaster bash -c \
-  "source /usr/local/greenplum-db/greenplum_path.sh && \
-   gpfdist -d /tmp/csv -p 8080 -l /tmp/gpfdist.log -v"
-
-# Проверить доступность:
-docker exec gpmaster bash -c "curl -s http://localhost:8080/ | head -5"
+# Проверить, что процесс gpfdist запущен:
+docker exec gpfdist pgrep -a gpfdist
 ```
 
 ### Внешние таблицы
 
-Сегменты подключаются к gpfdist по имени хоста `gpmaster` (hostname контейнера):
+Сегменты подключаются к gpfdist по hostname контейнера `gpfdist`:
 
 ```sql
 CREATE EXTERNAL TABLE ext_gpfdist_orders (
@@ -384,17 +376,14 @@ CREATE EXTERNAL TABLE ext_gpfdist_orders (
     price_usd          NUMERIC(10,2),
     cogs_usd           NUMERIC(10,2)
 )
-LOCATION ('gpfdist://gpmaster:8080/orders.csv')
+LOCATION ('gpfdist://gpfdist:8080/orders.csv')
 FORMAT 'CSV' (HEADER TRUE);
 ```
 
-Полный набор — `sql/gpfdist_external_table.sql`.
+Полный набор — `sql/gpfdist_external_table.sql`. Таблицы создаются автоматически через `setup.sh`. Для ручной проверки:
 
 ```bash
-docker exec -i gpmaster psql -U gpadmin -d toystore < sql/gpfdist_external_table.sql
-
-# Проверить:
-docker exec gpmaster psql -U gpadmin -d toystore \
+docker exec -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -d toystore \
   -c "SELECT COUNT(*) FROM ext_gpfdist_orders;"
 ```
 
