@@ -237,7 +237,7 @@ ORDER BY total_revenue DESC;
 `orders` и `order_items` оба распределены по `order_id` → JOIN **локальный**. `products` (4 строки) → **Broadcast Motion**.
 
 ```
--- EXPLAIN ANALYZE Q1 (v1), execution time: 68.294 ms
+-- EXPLAIN ANALYZE Q1 (v1), execution time: 63.254 ms
 Gather Motion 2:1  (slice3; segments: 2)  (actual time=60.5..60.5 rows=4)
   -> HashAggregate  Group Key: product_name
        -> Redistribute Motion 2:2  Hash Key: product_name        ← финальная агрегация
@@ -269,7 +269,7 @@ ORDER BY total_sessions DESC;
 `website_sessions` распределена по `website_session_id`, `orders` — по `order_id`. JOIN по `website_session_id`, которого нет в ключе `orders` → **Redistribute Motion на `orders`**.
 
 ```
--- EXPLAIN ANALYZE Q2 (v1), execution time: 778.803 ms
+-- EXPLAIN ANALYZE Q2 (v1), execution time: 1059.413 ms
 Gather Motion 2:1  (slice4; segments: 2)  (actual time=774.6..774.6 rows=8)
   -> Sort  (Merge Key: count(website_session_id))
        -> Hash Join  (utm_source, device_type)
@@ -304,7 +304,7 @@ ORDER BY refund_rate_pct DESC NULLS LAST;
 `order_items` распределена по `order_id`, `order_item_refunds` — по `order_item_id` (намеренное несовпадение). JOIN по `order_item_id`: `order_item_refunds` уже распределена по ключу JOIN → лежит на месте; `order_items` нужно перераспределить → **Redistribute Motion на `order_items`**. `products` → **Broadcast Motion**.
 
 ```
--- EXPLAIN ANALYZE Q3 (v1), execution time: 7.386 ms
+-- EXPLAIN ANALYZE Q3 (v1), execution time: 14.649 ms
 Gather Motion 2:1  (slice4; segments: 2)  (actual time=7.1..7.1 rows=4)
   -> Sort  (Merge Key: refund_rate_pct)
        -> HashAggregate  Group Key: product_name
@@ -323,7 +323,7 @@ Gather Motion 2:1  (slice4; segments: 2)  (actual time=7.1..7.1 rows=4)
 
 ### Перераспределение (v1 → v2)
 
-`sql/redistribution.sql` создаёт таблицу с новым ключом, переносит данные через `INSERT INTO ... SELECT`, затем `DROP TABLE` + `ALTER TABLE RENAME`:
+`sql/redistribution.sql` перераспределяет данные на месте через `ALTER TABLE ... SET DISTRIBUTED BY ... REORGANIZE=TRUE` — без создания промежуточных таблиц:
 
 - `orders`: `order_id` → `website_session_id`
 - `order_item_refunds`: `order_item_id` → `order_id`
@@ -337,7 +337,7 @@ docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -
 **Q1** — добавляется **Redistribute Motion на `orders`** (регрессия): `order_items` остаётся по `order_id`, а `orders` теперь по `website_session_id` → ключи расходятся.
 
 ```
--- EXPLAIN ANALYZE Q1 (v2), execution time: 52.348 ms
+-- EXPLAIN ANALYZE Q1 (v2), execution time: 54.401 ms
 Gather Motion 2:1  (slice4; segments: 2)  (actual time=42.2..42.2 rows=4)
   -> HashAggregate  Group Key: product_name
        -> Redistribute Motion 2:2  Hash Key: product_name        ← финальная агрегация
@@ -355,7 +355,7 @@ Gather Motion 2:1  (slice4; segments: 2)  (actual time=42.2..42.2 rows=4)
 **Q2** — Redistribute Motion на `orders` **устраняется** (улучшение): `orders` и `website_sessions` теперь оба по `website_session_id` → JOIN локальный.
 
 ```
--- EXPLAIN ANALYZE Q2 (v2), execution time: 1128.749 ms
+-- EXPLAIN ANALYZE Q2 (v2), execution time: 919.914 ms
 Gather Motion 2:1  (slice3; segments: 2)  (actual time=1128.2..1128.2 rows=8)
   -> Sort  (Merge Key: count(website_session_id))
        -> Hash Join  (utm_source, device_type)
@@ -375,7 +375,7 @@ Gather Motion 2:1  (slice3; segments: 2)  (actual time=1128.2..1128.2 rows=8)
 **Q3** — ожидалось улучшение, но фактически **регрессия**: `order_item_refunds` перешла с `order_item_id` на `order_id`, что совпадает с ключом `order_items`. Однако JOIN выполняется по `order_item_id`, а не по `order_id` — оптимизатор не может использовать ко-локацию по `order_id` для этого условия. Итог: теперь **оба** источника перераспределяются (v1 — только `order_items`).
 
 ```
--- EXPLAIN ANALYZE Q3 (v2), execution time: 10.869 ms
+-- EXPLAIN ANALYZE Q3 (v2), execution time: 11.659 ms
 Gather Motion 2:1  (slice5; segments: 2)  (actual time=7.8..7.8 rows=4)
   -> Sort  (Merge Key: refund_rate_pct)
        -> HashAggregate  Group Key: product_name
@@ -410,10 +410,10 @@ python3 plots/distribution_analysis.py v2
 
 | Запрос | Motion V1 | Motion V2 | Результат |
 |--------|-----------|-----------|-----------|
-| Q1: `orders ↔ order_items` | LOCAL (68 ms) | **Redistribute** (52 ms) | Регрессия плана; быстрее за счёт меньшего числа колонок |
+| Q1: `orders ↔ order_items` | LOCAL (63 ms) | **Redistribute** (54 ms) | Регрессия плана; быстрее за счёт меньшего числа колонок |
 | Q1: `products` | Broadcast | Broadcast | Без изменений |
-| Q2: `orders` | **Redistribute** (779 ms) | LOCAL (1129 ms) | Motion устранён; медленнее из-за spill DISTINCT-агрегата |
-| Q3: `order_items` | **Redistribute** (7 ms) | **Redistribute** (11 ms) | Motion сохранился |
+| Q2: `orders` | **Redistribute** (1059 ms) | LOCAL (920 ms) | Motion устранён; ускорение несмотря на spill DISTINCT-агрегата |
+| Q3: `order_items` | **Redistribute** (15 ms) | **Redistribute** (12 ms) | Motion сохранился |
 | Q3: `order_item_refunds` | LOCAL (dist by `order_item_id`) | **Redistribute** (регрессия) | Добавился второй Motion |
 | Q3: `products` | Broadcast | Broadcast | Без изменений |
 
