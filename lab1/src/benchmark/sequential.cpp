@@ -24,7 +24,7 @@ static double simulate_ruin_seq(const Config& cfg, uint64_t seed)
 static void bench_sequential(benchmark::State& state)
 {
     const char* data_path = std::getenv("BENCH_SEQ_DATA");
-    const char* out_csv   = std::getenv("BENCH_OUTPUT_CSV");
+    const char* out_csv = std::getenv("BENCH_OUTPUT_CSV");
     const auto configs = read_configs(data_path);
 
     int64_t total_games = 0;

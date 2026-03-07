@@ -50,7 +50,7 @@ static void bench_parallel(benchmark::State& state)
 {
     const size_t num_threads = static_cast<size_t>(state.range(0));
     const char* data_path = std::getenv("BENCH_PAR_DATA");
-    const char* out_csv   = std::getenv("BENCH_OUTPUT_CSV");
+    const char* out_csv = std::getenv("BENCH_OUTPUT_CSV");
     const auto configs = read_configs(data_path);
 
     int64_t total_games = 0;

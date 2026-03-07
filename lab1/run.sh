@@ -7,6 +7,13 @@ BENCH="${BUILD_DIR}/bin/lab1"
 RESULTS_DIR="${ROOT_DIR}/results"
 PLOTS_DIR="${ROOT_DIR}/plots"
 
+# Set CPU governor to performance for stable benchmark results
+echo "==> Setting CPU governor to performance..."
+for i in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance | sudo tee "$i" > /dev/null
+done
+trap 'echo "==> Restoring CPU governor to powersave..."; for i in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo powersave | sudo tee "$i" > /dev/null; done' EXIT
+
 # Generate data files if absent
 if [ ! -f "${ROOT_DIR}/data/same_data.bin" ] || \
    [ ! -f "${ROOT_DIR}/data/seq_data.bin" ] || \

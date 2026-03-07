@@ -31,10 +31,14 @@ def make_plots(csv_path: Path, out_dir: str, prefix: str) -> None:
     threads = grp["num_threads"].values
 
     # mean execution time bar chart
+    grp_bar = pd.concat([
+        pd.DataFrame({"num_threads": [1], "mean": [seq_mean]}),
+        grp[["num_threads", "mean"]],
+    ], ignore_index=True)
     fig, ax = plt.subplots(figsize=(10, 6))
     sns.barplot(
         x="num_threads", y="mean",
-        data=grp, color="steelblue",
+        data=grp_bar, color="steelblue",
         errorbar=None, ax=ax,
     )
     ax.axhline(seq_mean, color="orange", linestyle="--",
