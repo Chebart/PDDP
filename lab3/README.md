@@ -195,16 +195,16 @@ skew_pct = (max_rows − min_rows) / avg_rows × 100
 
 Значение `skew_pct < 10 %` считается приемлемым. `distribution_analysis.py` подключается к Greenplum через порт 5432 и сохраняет `plots/distribution_v1.png`. Каждая панель — одна таблица, пунктирная линия — идеальное распределение 50/50.
 
-### Ожидаемые результаты (v1)
+### Фактические результаты (v1)
 
-| Таблица | skew_pct | Причина |
-|---------|----------|---------|
-| `website_sessions` | < 1 % | Большая кардинальность, хеш практически равномерен |
-| `website_pageviews` | < 1 % | Наследует распределение `session_id` |
-| `orders` | < 1 % | Большая кардинальность `order_id` |
-| `order_items` | < 1 % | Большая кардинальность `order_id` |
-| `order_item_refunds` | 1–5 % | Меньший объём — чуть больший разброс |
-| `products` | ~50 % | Всего 4 строки: хеш 2/2 или 3/1 — нормально для микро-таблицы |
+| Таблица | seg 0 | seg 1 | skew_pct | Комментарий |
+|---------|-------|-------|----------|-------------|
+| `website_sessions` | 236 511 (50.02 %) | 236 360 (49.98 %) | **0.06 %** | Практически идеальное распределение |
+| `website_pageviews` | 593 999 (49.99 %) | 594 125 (50.01 %) | **~0 %** | Аналогично |
+| `orders` | 16 127 (49.91 %) | 16 186 (50.09 %) | **0.37 %** | Хорошее равномерное распределение |
+| `order_items` | 19 955 (49.86 %) | 20 070 (50.14 %) | **0.57 %** | Хорошее равномерное распределение |
+| `order_item_refunds` | 895 (51.70 %) | 836 (48.30 %) | **6.82 %** | Небольшой skew из-за малого объёма |
+| `products` | 3 (75.00 %) | 1 (25.00 %) | **100 %** | Ожидаемо для 4 строк (хеш 3/1) — оптимизатор выбирает Broadcast |
 
 ---
 
@@ -237,7 +237,18 @@ ORDER BY total_revenue DESC;
 `orders` и `order_items` оба распределены по `order_id` → JOIN **локальный**. `products` (4 строки) → **Broadcast Motion**.
 
 ```
--- вывод EXPLAIN ANALYZE (v1):
+-- EXPLAIN ANALYZE Q1 (v1), execution time: 68.294 ms
+Gather Motion 2:1  (slice3; segments: 2)  (actual time=60.5..60.5 rows=4)
+  -> HashAggregate  Group Key: product_name
+       -> Redistribute Motion 2:2  Hash Key: product_name        ← финальная агрегация
+            -> HashAggregate  Group Key: product_name, order_id
+                 -> Hash Join  Hash Cond: order_items.order_id = orders.order_id  ← LOCAL
+                      -> Seq Scan on order_items
+                      -> Hash
+                           -> Seq Scan on orders
+                 -> Hash
+                      -> Broadcast Motion 2:2  (slice1)          ← products (4 строки)
+                           -> Seq Scan on products
 ```
 
 ### Q2 — Конверсия сессий в заказы по UTM-источнику и устройству (v1)
@@ -258,7 +269,20 @@ ORDER BY total_sessions DESC;
 `website_sessions` распределена по `website_session_id`, `orders` — по `order_id`. JOIN по `website_session_id`, которого нет в ключе `orders` → **Redistribute Motion на `orders`**.
 
 ```
--- вывод EXPLAIN ANALYZE (v1):
+-- EXPLAIN ANALYZE Q2 (v1), execution time: 778.803 ms
+Gather Motion 2:1  (slice4; segments: 2)  (actual time=774.6..774.6 rows=8)
+  -> Sort  (Merge Key: count(website_session_id))
+       -> Hash Join  (utm_source, device_type)
+            -> HashAggregate  Group Key: utm_source, device_type
+                 -> Redistribute Motion 2:2  Hash Key: utm_source, device_type
+                      -> ...
+                           -> Hash Left Join  Hash Cond: ws.website_session_id = o.website_session_id
+                                -> Seq Scan on website_sessions ws
+                                -> Hash
+                                     -> Redistribute Motion 2:2  Hash Key: o.website_session_id  ← REDISTRIBUTE на orders
+                                          -> Seq Scan on orders o
+            -> Hash  (count(website_session_id))
+                 -> ...
 ```
 
 ### Q3 — Процент возвратов по продуктам (v1)
@@ -277,10 +301,24 @@ GROUP BY p.product_name
 ORDER BY refund_rate_pct DESC NULLS LAST;
 ```
 
-`order_items` распределена по `order_id`, `order_item_refunds` — по `order_item_id` (намеренное несовпадение). JOIN по `order_item_id` → **Redistribute Motion на `order_items`**. `products` → **Broadcast Motion**.
+`order_items` распределена по `order_id`, `order_item_refunds` — по `order_item_id` (намеренное несовпадение). JOIN по `order_item_id`: `order_item_refunds` уже распределена по ключу JOIN → лежит на месте; `order_items` нужно перераспределить → **Redistribute Motion на `order_items`**. `products` → **Broadcast Motion**.
 
 ```
--- вывод EXPLAIN ANALYZE (v1):
+-- EXPLAIN ANALYZE Q3 (v1), execution time: 7.386 ms
+Gather Motion 2:1  (slice4; segments: 2)  (actual time=7.1..7.1 rows=4)
+  -> Sort  (Merge Key: refund_rate_pct)
+       -> HashAggregate  Group Key: product_name
+            -> Redistribute Motion 2:2  Hash Key: product_name   ← финальная агрегация
+                 -> HashAggregate  Group Key: product_name
+                      -> Hash Join  Hash Cond: order_items.product_id = products.product_id
+                           -> Hash Left Join  Hash Cond: order_items.order_item_id = order_item_refunds.order_item_id
+                                -> Redistribute Motion 2:2  Hash Key: order_items.order_item_id  ← REDISTRIBUTE на order_items
+                                     -> Seq Scan on order_items
+                                -> Hash
+                                     -> Seq Scan on order_item_refunds        ← LOCAL (dist by order_item_id)
+                           -> Hash
+                                -> Broadcast Motion 2:2  (slice2)             ← products (4 строки)
+                                     -> Seq Scan on products
 ```
 
 ### Перераспределение (v1 → v2)
@@ -299,19 +337,60 @@ docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -
 **Q1** — добавляется **Redistribute Motion на `orders`** (регрессия): `order_items` остаётся по `order_id`, а `orders` теперь по `website_session_id` → ключи расходятся.
 
 ```
--- вывод EXPLAIN ANALYZE (v2):
+-- EXPLAIN ANALYZE Q1 (v2), execution time: 52.348 ms
+Gather Motion 2:1  (slice4; segments: 2)  (actual time=42.2..42.2 rows=4)
+  -> HashAggregate  Group Key: product_name
+       -> Redistribute Motion 2:2  Hash Key: product_name        ← финальная агрегация
+            -> HashAggregate  Group Key: product_name, order_id
+                 -> Hash Join  Hash Cond: order_items.order_id = orders.order_id
+                      -> Seq Scan on order_items
+                      -> Hash
+                           -> Redistribute Motion 2:2  Hash Key: orders.order_id  ← REDISTRIBUTE на orders (регрессия)
+                                -> Seq Scan on orders
+                 -> Hash
+                      -> Broadcast Motion 2:2  (slice2)          ← products (4 строки)
+                           -> Seq Scan on products
 ```
 
 **Q2** — Redistribute Motion на `orders` **устраняется** (улучшение): `orders` и `website_sessions` теперь оба по `website_session_id` → JOIN локальный.
 
 ```
--- вывод EXPLAIN ANALYZE (v2):
+-- EXPLAIN ANALYZE Q2 (v2), execution time: 1128.749 ms
+Gather Motion 2:1  (slice3; segments: 2)  (actual time=1128.2..1128.2 rows=8)
+  -> Sort  (Merge Key: count(website_session_id))
+       -> Hash Join  (utm_source, device_type)
+            -> HashAggregate  Group Key: utm_source, device_type
+                 -> Redistribute Motion 2:2  Hash Key: utm_source, device_type
+                      -> ...
+            -> Hash
+                 -> HashAggregate  Group Key: utm_source, device_type
+                      -> ...
+                           -> Materialize
+                                -> Hash Left Join  Hash Cond: ws.website_session_id = o.website_session_id  ← LOCAL
+                                     -> Seq Scan on website_sessions ws
+                                     -> Hash
+                                          -> Seq Scan on orders o              ← без Redistribute Motion
 ```
 
-**Q3** — Redistribute Motion на `order_items` **устраняется** (улучшение): `order_item_refunds` перешла на `order_id`, как и `order_items` → данные ко-локированы.
+**Q3** — ожидалось улучшение, но фактически **регрессия**: `order_item_refunds` перешла с `order_item_id` на `order_id`, что совпадает с ключом `order_items`. Однако JOIN выполняется по `order_item_id`, а не по `order_id` — оптимизатор не может использовать ко-локацию по `order_id` для этого условия. Итог: теперь **оба** источника перераспределяются (v1 — только `order_items`).
 
 ```
--- вывод EXPLAIN ANALYZE (v2):
+-- EXPLAIN ANALYZE Q3 (v2), execution time: 10.869 ms
+Gather Motion 2:1  (slice5; segments: 2)  (actual time=7.8..7.8 rows=4)
+  -> Sort  (Merge Key: refund_rate_pct)
+       -> HashAggregate  Group Key: product_name
+            -> Redistribute Motion 2:2  Hash Key: product_name   ← финальная агрегация
+                 -> HashAggregate  Group Key: product_name
+                      -> Hash Join  Hash Cond: order_items.product_id = products.product_id
+                           -> Hash Left Join  Hash Cond: order_items.order_item_id = order_item_refunds.order_item_id
+                                -> Redistribute Motion 2:2  Hash Key: order_items.order_item_id     ← REDISTRIBUTE на order_items
+                                     -> Seq Scan on order_items
+                                -> Hash
+                                     -> Redistribute Motion 2:2  Hash Key: order_item_refunds.order_item_id  ← REDISTRIBUTE на order_item_refunds (регрессия)
+                                          -> Seq Scan on order_item_refunds
+                           -> Hash
+                                -> Broadcast Motion 2:2  (slice3)             ← products (4 строки)
+                                     -> Seq Scan on products
 ```
 
 ### Запуск
@@ -327,22 +406,24 @@ docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -
 python3 plots/distribution_analysis.py v2
 ```
 
-### Сводная таблица Motion
+### Сводная таблица Motion (фактические результаты)
 
-| Запрос | Motion V1 | Motion V2 |
-|--------|-----------|-----------|
-| Q1: `orders ↔ order_items` | LOCAL | **Redistribute** |
-| Q1: `products` | Broadcast | Broadcast |
-| Q2: `orders` | **Redistribute** | LOCAL |
-| Q3: `order_items` | **Redistribute** | LOCAL |
-| Q3: `products` | Broadcast | Broadcast |
+| Запрос | Motion V1 | Motion V2 | Результат |
+|--------|-----------|-----------|-----------|
+| Q1: `orders ↔ order_items` | LOCAL (68 ms) | **Redistribute** (52 ms) | Регрессия плана; быстрее за счёт меньшего числа колонок |
+| Q1: `products` | Broadcast | Broadcast | Без изменений |
+| Q2: `orders` | **Redistribute** (779 ms) | LOCAL (1129 ms) | Motion устранён; медленнее из-за spill DISTINCT-агрегата |
+| Q3: `order_items` | **Redistribute** (7 ms) | **Redistribute** (11 ms) | Motion сохранился |
+| Q3: `order_item_refunds` | LOCAL (dist by `order_item_id`) | **Redistribute** (регрессия) | Добавился второй Motion |
+| Q3: `products` | Broadcast | Broadcast | Без изменений |
 
 ### Выводы
 
-- **Ко-локация** по join-ключу — единственный способ устранить Motion: ключи дистрибьюции обеих сторон JOIN должны совпадать с колонкой условия.
-- **Изменение ключа** — всегда компромисс: улучшение Q2 и Q3 деградировало Q1.
+- **Ко-локация** работает только тогда, когда ключ дистрибьюции совпадает именно с колонкой JOIN-условия, а не просто с «соседней» колонкой одной таблицы.
+- **Перераспределение `orders`** (order_id → website_session_id) устранило Motion в Q2, но внесло регрессию в Q1 — классический компромисс при смене ключа.
+- **Перераспределение `order_item_refunds`** (order_item_id → order_id) оказалось контрпродуктивным для Q3: в v1 таблица лежала точно по ключу JOIN (`order_item_id`), в v2 — нет, что добавило второй Redistribute Motion.
 - **Broadcast** для `products` оптимизатор выбирает автоматически — передача 4 строк дешевле перераспределения крупных таблиц.
-- При выборе ключа в продакшене нужно ориентироваться на самый частый и тяжёлый запрос.
+- При выборе ключа в продакшене нужно ориентироваться на самый частый и тяжёлый запрос и моделировать все смежные запросы: улучшение одного сценария может деградировать несколько других.
 
 ---
 
@@ -405,5 +486,5 @@ docker exec -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpadmin -d t
 - Развёрнут Greenplum-кластер (1 мастер + 2 сегмента) совместно с PostgreSQL через Docker Compose; все параметры вынесены в `.env`.
 - Выбран датасет Maven Fuzzy Factory (6 таблиц); данные загружены в PostgreSQL через init-скрипты и перенесены в GP через PXF external tables с профилем `Jdbc`.
 - Обоснованы начальные ключи дистрибьюции (v1): высококардинальные колонки обеспечивают `skew_pct < 1 %` для крупных таблиц; результаты визуализированы Python-скриптом.
-- Выполнены три аналитических запроса до и после перераспределения; для каждого разобрано поведение Redistribute и Broadcast Motion: перераспределение `orders` и `order_item_refunds` устранило Motion в Q2 и Q3 ценой регрессии в Q1.
+- Выполнены три аналитических запроса до и после перераспределения; для каждого получен и разобран реальный план `EXPLAIN ANALYZE`: перераспределение `orders` устранило Redistribute Motion в Q2, но внесло регрессию в Q1; перераспределение `order_item_refunds` (order_item_id → order_id) оказалось контрпродуктивным — добавило второй Motion в Q3 вместо устранения первого, поскольку JOIN выполняется по `order_item_id`, а не по `order_id`.
 - Запущен gpfdist внутри контейнера `gpmaster` для параллельной загрузки CSV без JDBC-overhead.
