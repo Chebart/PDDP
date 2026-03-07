@@ -1,5 +1,9 @@
 x-gpbase: &gpbase
   image: woblerr/greenplum:6.27.1-v0.6
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
 
 x-gp-env: &gp-env
   GREENPLUM_PASSWORD: "${GREENPLUM_PASSWORD}"
@@ -51,12 +55,12 @@ services:
     <<: *gp-segment
     container_name: gpsegment1
     hostname: gpsegment1
-    command: /start_gpdb.sh "00:primary"
+    command: /start_gpdb.sh "00:primary" "01:mirror"
     volumes:
       - ./greenplum/ssh/id_rsa:/home/gpadmin/.ssh/id_rsa
       - ./greenplum/ssh/id_rsa.pub:/home/gpadmin/.ssh/id_rsa.pub
       - ./greenplum/ssh/authorized_keys:/home/gpadmin/.ssh/authorized_keys
-      - gp_seg1_data:/data/primary
+      - gp_seg1_data:/data
     networks:
       gpnet:
         aliases: [gpsegment1]
@@ -65,12 +69,12 @@ services:
     <<: *gp-segment
     container_name: gpsegment2
     hostname: gpsegment2
-    command: /start_gpdb.sh "01:primary"
+    command: /start_gpdb.sh "00:primary" "01:mirror"
     volumes:
       - ./greenplum/ssh/id_rsa:/home/gpadmin/.ssh/id_rsa
       - ./greenplum/ssh/id_rsa.pub:/home/gpadmin/.ssh/id_rsa.pub
       - ./greenplum/ssh/authorized_keys:/home/gpadmin/.ssh/authorized_keys
-      - gp_seg2_data:/data/primary
+      - gp_seg2_data:/data
     networks:
       gpnet:
         aliases: [gpsegment2]
