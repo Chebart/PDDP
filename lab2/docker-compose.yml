@@ -1,0 +1,115 @@
+services:
+  spark-master:
+    build:
+      context: .
+      dockerfile: build/spark/Dockerfile
+    command: "/opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --port ${SPARK_MASTER_PORT} --webui-port ${SPARK_MASTER_WEBUI_PORT}"
+    ports:
+      - "${SPARK_MASTER_PORT}:${SPARK_MASTER_PORT}"
+      - "${SPARK_MASTER_WEBUI_PORT}:${SPARK_MASTER_WEBUI_PORT}"
+
+  spark-worker-1:
+    build:
+      context: .
+      dockerfile: build/spark/Dockerfile
+    command: "/opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker --memory ${SPARK_WORKER_MEMORY} --cores ${SPARK_WORKER_CORES} spark://spark-master:${SPARK_MASTER_PORT}"
+    depends_on:
+      - spark-master
+
+  spark-worker-2:
+    build:
+      context: .
+      dockerfile: build/spark/Dockerfile
+    command: "/opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker --memory ${SPARK_WORKER_MEMORY} --cores ${SPARK_WORKER_CORES} spark://spark-master:${SPARK_MASTER_PORT}"
+    depends_on:
+      - spark-master
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    environment:
+      KAFKA_NODE_ID: "0"
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  spark-driver:
+    build:
+      context: .
+      dockerfile: build/spark/Dockerfile
+    command: >
+      /opt/spark/bin/spark-submit
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.3
+        --conf spark.jars.ivy=/tmp/ivy2
+        --master spark://spark-master:${SPARK_MASTER_PORT}
+        --conf spark.driver.host=spark-driver
+        --conf spark.driver.bindAddress=0.0.0.0
+        /app/main.py
+    ports:
+      - "4040:4040"
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER}
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      spark-master:
+        condition: service_started
+      spark-worker-1:
+        condition: service_started
+      spark-worker-2:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  producer:
+    build:
+      context: .
+      dockerfile: build/producer/Dockerfile
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER}
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      SEND_INTERVAL: ${PRODUCER_SEND_INTERVAL}
+      DATA_PATH: /data/city_temperature.csv
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+volumes:
+  pg_data:
