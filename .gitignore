@@ -3,5 +3,6 @@
 *data
 *__pycache__
 *.pdf
-greenplum/ssh/
-pxf_conf/lib/
+
+lab3/greenplum/ssh/
+lab3/pxf_conf/lib/
