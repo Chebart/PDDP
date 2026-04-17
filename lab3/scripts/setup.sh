@@ -9,13 +9,27 @@ PSQL="docker exec -i -u gpadmin gpmaster /usr/local/greenplum-db/bin/psql -U gpa
 
 step() { echo; echo "── $* ──────────────────────────────────────"; }
 
-step "1/4  Downloading dataset"
+set -a; source "$BASE/.env"; set +a
+
+step "1/5  Downloading dataset"
 ./scripts/download_data.sh
 
-step "2/4  SSH keys"
+step "2/5  SSH keys"
+sudo rm -rf greenplum/ssh/
 ./scripts/generate_ssh_keys.sh
 
-step "3/4  Starting containers"
+step "3/5  PXF config"
+sudo chown -R "$(id -u):$(id -g)" pxf_conf/ 2>/dev/null || true
+JDBC_JAR="pxf_conf/lib/postgresql-42.7.1.jar"
+if [[ ! -f "$JDBC_JAR" ]]; then
+    echo "Downloading PostgreSQL JDBC driver..."
+    wget -q -O "$JDBC_JAR" https://jdbc.postgresql.org/download/postgresql-42.7.1.jar
+fi
+envsubst < pxf_conf/servers/postgres/jdbc-site.xml.tmpl \
+    > pxf_conf/servers/postgres/jdbc-site.xml
+echo "PXF config ready."
+
+step "4/5  Starting containers"
 docker compose up -d postgres gpsegment1 gpsegment2
 
 echo "Waiting for Postgres to be ready..."
@@ -34,17 +48,22 @@ for i in $(seq 1 15); do
     sleep 10
 done
 
-for seg in gpsegment1 gpsegment2; do
-    docker exec -u root "$seg" chown -R gpadmin:gpadmin /usr/local/pxf
-done
+PXF_ENV="source /usr/local/greenplum-db/greenplum_path.sh
+    export PATH=/usr/local/pxf/bin:\$PATH
+    export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+    export MASTER_DATA_DIRECTORY=/data/master/gpseg-1
+    export PXF_BASE=/data/pxf"
 
-docker cp scripts/setup_pxf.sh gpmaster:/tmp/setup_pxf.sh
-docker exec -u root gpmaster bash /tmp/setup_pxf.sh
+docker exec -u gpadmin gpmaster bash -c "$PXF_ENV && pxf cluster prepare"
+docker exec -u gpadmin gpmaster mkdir -p /data/pxf/servers/postgres /data/pxf/lib
+docker cp pxf_conf/servers/postgres/jdbc-site.xml gpmaster:/data/pxf/servers/postgres/jdbc-site.xml
+docker cp pxf_conf/lib/postgresql-42.7.1.jar     gpmaster:/data/pxf/lib/postgresql-42.7.1.jar
+docker exec -u gpadmin gpmaster bash -c "$PXF_ENV && pxf cluster sync && pxf cluster start"
 
 $PSQL < sql/pxf_external_tables.sql
 $PSQL < sql/gp_tables.sql
 
-step "4/4  Starting gpfdist"
+step "5/5  Starting gpfdist"
 docker compose up -d gpfdist
 
 echo "Waiting for gpfdist to be ready..."

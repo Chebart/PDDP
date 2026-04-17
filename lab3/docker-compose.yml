@@ -23,20 +23,11 @@ services:
     environment:
       <<: *gp-env
       GREENPLUM_DEPLOYMENT: master
-      GREENPLUM_PXF_ENABLE: "true"
       GREENPLUM_DATABASE_NAME: "${GP_DATABASE}"
-      POSTGRES_HOST: "${POSTGRES_HOST}"
-      POSTGRES_DB: "${POSTGRES_DB}"
-      POSTGRES_USER: "${POSTGRES_USER}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
-      PXF_JDBC_FETCH_SIZE: "${PXF_JDBC_FETCH_SIZE}"
     volumes:
-      - ./greenplum/ssh/id_rsa:/home/gpadmin/.ssh/id_rsa
-      - ./greenplum/ssh/id_rsa.pub:/home/gpadmin/.ssh/id_rsa.pub
-      - ./greenplum/ssh/authorized_keys:/home/gpadmin/.ssh/authorized_keys
+      - ./greenplum/ssh:/home/gpadmin/.ssh
       - ./greenplum/config/gpinitsystem_config:/tmp/gpinitsystem_config:ro
       - ./greenplum/config/hostfile_gpinitsystem:/tmp/hostfile_gpinitsystem:ro
-      - ./pxf:/tmp/pxf:ro
       - gp_master_data:/data/master
     ports:
       - "5432:5432"
@@ -57,9 +48,7 @@ services:
     hostname: gpsegment1
     command: /start_gpdb.sh "00:primary" "01:mirror"
     volumes:
-      - ./greenplum/ssh/id_rsa:/home/gpadmin/.ssh/id_rsa
-      - ./greenplum/ssh/id_rsa.pub:/home/gpadmin/.ssh/id_rsa.pub
-      - ./greenplum/ssh/authorized_keys:/home/gpadmin/.ssh/authorized_keys
+      - ./greenplum/ssh:/home/gpadmin/.ssh
       - gp_seg1_data:/data
     networks:
       gpnet:
@@ -71,9 +60,7 @@ services:
     hostname: gpsegment2
     command: /start_gpdb.sh "00:primary" "01:mirror"
     volumes:
-      - ./greenplum/ssh/id_rsa:/home/gpadmin/.ssh/id_rsa
-      - ./greenplum/ssh/id_rsa.pub:/home/gpadmin/.ssh/id_rsa.pub
-      - ./greenplum/ssh/authorized_keys:/home/gpadmin/.ssh/authorized_keys
+      - ./greenplum/ssh:/home/gpadmin/.ssh
       - gp_seg2_data:/data
     networks:
       gpnet:
