@@ -1,0 +1,136 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: lab4-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./data/postgres:/data/csv:ro
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mongodb:
+    image: mongo:7
+    container_name: lab4-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mongo-init:
+    image: python:3.11-slim
+    container_name: lab4-mongo-init
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./init/mongodb:/init:ro
+      - ./data/mongodb:/csv:ro
+    command: ["sh", "-c", "pip install --no-cache-dir pymongo==4.8.0 && python /init/load.py"]
+    restart: "no"
+
+  minio:
+    image: minio/minio:latest
+    container_name: lab4-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: lab4-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./data/minio:/csv:ro
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} >/dev/null 2>&1; do sleep 1; done;
+      mc mb -p local/lake;
+      mc cp /csv/clickstream.csv local/lake/clickstream/clickstream.csv;
+      mc cp /csv/product_media_metadata.csv local/lake/product_media_metadata/product_media_metadata.csv;
+      echo 'minio loaded';
+      "
+    restart: "no"
+
+  hive-metastore:
+    build: ./trino/hms
+    container_name: lab4-hms
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./trino/hms/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      HADOOP_OPTIONAL_TOOLS: hadoop-aws
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER}
+        -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/9083"]
+      start_period: 90s
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  trino:
+    image: trinodb/trino:455
+    container_name: lab4-trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/etc:/etc/trino:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  pg-data:
+  mongo-data:
+  minio-data:
