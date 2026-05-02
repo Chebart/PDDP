@@ -217,7 +217,7 @@ MongoDB хранит поисковый запрос в поле `q` внутр�
 
 В датасете каждый `session_id` встречается только на одной странице, поэтому классическую воронку «пользователь перешёл с home на category» по сессиям не построить. Реализованы два варианта.
 
-**Первый — по сессиям.** `stage_sessions` считает, сколько уникальных сессий было на каждой странице. CTE `stages` задаёт фиксированный порядок шагов через UNION ALL — это нужно, чтобы оконные функции правильно определяли «предыдущий» и «первый» шаг. В `joined` к каждому шагу через LEFT JOIN подтягивается количество сессий, а два оконных вызова считают конверсию: `LAG` берёт значение предыдущего шага (для `step_share`), а подзапрос на `step = 1` — значение home (для `share_of_home`). JOIN сделан от `stages` к `stage_sessions`, а не наоборот — чтобы шаги не пропадали, если по какой-то странице данных нет.
+**Первый — по сессиям.** `stage_sessions` считает, сколько уникальных сессий было на каждой странице. `stages` задаёт фиксированный порядок шагов через `VALUES` — это нужно, чтобы оконные функции правильно определяли «предыдущий» и «первый» шаг. В `joined` к каждому шагу через LEFT JOIN подтягивается количество сессий: `LAG` берёт значение предыдущего шага для `step_share`, `FIRST_VALUE` — значение home для `share_of_home`. JOIN сделан от `stages` к `stage_sessions`, а не наоборот — чтобы шаги не пропадали, если по какой-то странице данных нет.
 
 ```sql
 WITH stage_sessions AS (
@@ -226,46 +226,56 @@ WITH stage_sessions AS (
     WHERE page IN ('home', 'category', 'product', 'cart', 'checkout')
     GROUP BY page
 ),
-stages AS (
-    SELECT 1 AS step, 'home' AS stage UNION ALL
-    SELECT 2, 'category'             UNION ALL
-    ...
+stages(step, stage) AS (
+    VALUES (1, 'home'), (2, 'category'), (3, 'product'), (4, 'cart'), (5, 'checkout')
 ),
 joined AS (
     SELECT s.step, s.stage,
         COALESCE(ss.sessions, 0) AS sessions,
-        LAG(COALESCE(ss.sessions, 0)) OVER (ORDER BY s.step) AS prev_sessions
+        LAG(COALESCE(ss.sessions, 0)) OVER (ORDER BY s.step) AS prev_sessions,
+        FIRST_VALUE(COALESCE(ss.sessions, 0)) OVER (ORDER BY s.step) AS top_sessions
     FROM stages s
     LEFT JOIN stage_sessions ss ON ss.page = s.stage
 )
 SELECT step, stage, sessions,
     ROUND(sessions * 1.0 / NULLIF(prev_sessions, 0), 4) AS step_share,
-    ROUND(sessions * 1.0 / NULLIF((SELECT sessions FROM joined WHERE step = 1), 0), 4) AS share_of_home
+    ROUND(sessions * 1.0 / NULLIF(top_sessions, 0), 4) AS share_of_home
 FROM joined ORDER BY step;
 ```
 
-**Второй — по покупателям.** Один покупатель может иметь сессии на разных страницах, поэтому связующий ключ — `customer_id`. В `cust` все сессии покупателя сворачиваются в одну строку: `MAX(CASE WHEN page = 'home' THEN 1 ELSE 0 END)` даёт флаг 1, если покупатель хоть раз был на этой странице. В `funnel` считаем, сколько покупателей прошли каждый шаг последовательно — на category попадают только те, у кого флаг home тоже равен 1, и так далее по цепочке. Финальный `stages` раскладывает результат построчно и подтягивает значение предыдущего шага для расчёта `step_retention` и `overall_retention`.
+**Второй — по покупателям.** Связующий ключ — `customer_id`: у одного покупателя могут быть сессии на разных страницах. В `cust` все сессии покупателя сворачиваются в одну строку флагами через `BOOL_OR` — был ли он хоть раз на каждой странице. В `funnel` `COUNT_IF` считает, сколько покупателей прошли каждый шаг последовательно: на category попадают только те, у кого флаг home тоже true. `CROSS JOIN UNNEST` разворачивает широкую строку `funnel` в пять строк — по одной на шаг, без UNION ALL. Финальный SELECT считает `step_retention` через `LAG` и `overall_retention` через `FIRST_VALUE`.
 
 ```sql
 WITH cust AS (
     SELECT customer_id,
-        MAX(CASE WHEN page = 'home'     THEN 1 ELSE 0 END) AS h,
-        MAX(CASE WHEN page = 'category' THEN 1 ELSE 0 END) AS c,
-        MAX(CASE WHEN page = 'product'  THEN 1 ELSE 0 END) AS p,
-        MAX(CASE WHEN page = 'cart'     THEN 1 ELSE 0 END) AS ca,
-        MAX(CASE WHEN page = 'checkout' THEN 1 ELSE 0 END) AS ch
-    FROM hive.lake.clickstream GROUP BY customer_id
+        BOOL_OR(page = 'home') AS h,
+        BOOL_OR(page = 'category') AS c,
+        BOOL_OR(page = 'product') AS p,
+        BOOL_OR(page = 'cart') AS ca,
+        BOOL_OR(page = 'checkout') AS ch
+    FROM hive.lake.clickstream
+    GROUP BY customer_id
 ),
 funnel AS (
     SELECT
-        SUM(h) AS home,
-        SUM(CASE WHEN h=1 AND c=1 THEN 1 ELSE 0 END) AS category,
-        SUM(CASE WHEN h=1 AND c=1 AND p=1 THEN 1 ELSE 0 END) AS product,
-        ...
+        COUNT_IF(h) AS home,
+        COUNT_IF(h AND c) AS category,
+        COUNT_IF(h AND c AND p) AS product,
+        COUNT_IF(h AND c AND p AND ca) AS cart,
+        COUNT_IF(h AND c AND p AND ca AND ch) AS checkout
     FROM cust
+),
+steps AS (
+    SELECT step, stage, customers
+    FROM funnel
+    CROSS JOIN UNNEST(
+        ARRAY[1, 2, 3, 4, 5],
+        ARRAY['home', 'category', 'product', 'cart', 'checkout'],
+        ARRAY[home, category, product, cart, checkout]
+    ) AS t(step, stage, customers)
 )
 SELECT step, stage, customers,
-    ROUND(customers * 1.0 / NULLIF(prev, 0), 4) AS step_retention,
-    ROUND(customers * 1.0 / NULLIF((SELECT home FROM funnel), 0), 4) AS overall_retention
-FROM stages ORDER BY step;
+    ROUND(customers * 1.0 / NULLIF(LAG(customers) OVER (ORDER BY step), 0), 4) AS step_retention,
+    ROUND(customers * 1.0 / NULLIF(FIRST_VALUE(customers) OVER (ORDER BY step), 0), 4) AS overall_retention
+FROM steps ORDER BY step;
 ```
