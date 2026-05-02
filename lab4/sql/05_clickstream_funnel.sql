@@ -4,12 +4,8 @@ WITH stage_sessions AS (
     WHERE page IN ('home', 'category', 'product', 'cart', 'checkout')
     GROUP BY page
 ),
-stages AS (
-    SELECT 1 AS step, 'home' AS stage UNION ALL
-    SELECT 2, 'category' UNION ALL
-    SELECT 3, 'product' UNION ALL
-    SELECT 4, 'cart' UNION ALL
-    SELECT 5, 'checkout'
+stages(step, stage) AS (
+    VALUES (1, 'home'), (2, 'category'), (3, 'product'), (4, 'cart'), (5, 'checkout')
 ),
 joined AS (
     SELECT
@@ -17,8 +13,7 @@ joined AS (
         s.stage,
         COALESCE(ss.sessions, 0) AS sessions,
         LAG(COALESCE(ss.sessions, 0)) OVER (ORDER BY s.step) AS prev_sessions,
-        FIRST_VALUE(COALESCE(ss.sessions, 0))
-            OVER (ORDER BY s.step ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS top_sessions
+        FIRST_VALUE(COALESCE(ss.sessions, 0)) OVER (ORDER BY s.step) AS top_sessions
     FROM stages s
     LEFT JOIN stage_sessions ss ON ss.page = s.stage
 )
@@ -27,42 +22,44 @@ SELECT
     stage,
     sessions,
     ROUND(sessions * 1.0 / NULLIF(prev_sessions, 0), 4) AS step_share,
-    ROUND(sessions * 1.0 / NULLIF((SELECT sessions FROM joined WHERE step = 1), 0), 4) AS share_of_home
+    ROUND(sessions * 1.0 / NULLIF(top_sessions, 0), 4) AS share_of_home
 FROM joined
 ORDER BY step;
 
 WITH cust AS (
     SELECT
         customer_id,
-        MAX(CASE WHEN page = 'home' THEN 1 ELSE 0 END) AS h,
-        MAX(CASE WHEN page = 'category' THEN 1 ELSE 0 END) AS c,
-        MAX(CASE WHEN page = 'product' THEN 1 ELSE 0 END) AS p,
-        MAX(CASE WHEN page = 'cart' THEN 1 ELSE 0 END) AS ca,
-        MAX(CASE WHEN page = 'checkout' THEN 1 ELSE 0 END) AS ch
+        BOOL_OR(page = 'home') AS h,
+        BOOL_OR(page = 'category') AS c,
+        BOOL_OR(page = 'product') AS p,
+        BOOL_OR(page = 'cart') AS ca,
+        BOOL_OR(page = 'checkout') AS ch
     FROM hive.lake.clickstream
     GROUP BY customer_id
 ),
 funnel AS (
     SELECT
-        SUM(h) AS home,
-        SUM(CASE WHEN h = 1 AND c = 1 THEN 1 ELSE 0 END) AS category,
-        SUM(CASE WHEN h = 1 AND c = 1 AND p = 1 THEN 1 ELSE 0 END) AS product,
-        SUM(CASE WHEN h = 1 AND c = 1 AND p = 1 AND ca = 1 THEN 1 ELSE 0 END) AS cart,
-        SUM(CASE WHEN h = 1 AND c = 1 AND p = 1 AND ca = 1 AND ch = 1 THEN 1 ELSE 0 END) AS checkout
+        COUNT_IF(h) AS home,
+        COUNT_IF(h AND c) AS category,
+        COUNT_IF(h AND c AND p) AS product,
+        COUNT_IF(h AND c AND p AND ca) AS cart,
+        COUNT_IF(h AND c AND p AND ca AND ch) AS checkout
     FROM cust
 ),
-stages AS (
-    SELECT 1 AS step, 'home' AS stage, home AS customers, CAST(NULL AS BIGINT) AS prev FROM funnel UNION ALL
-    SELECT 2, 'category', category, home FROM funnel UNION ALL
-    SELECT 3, 'product', product, category FROM funnel UNION ALL
-    SELECT 4, 'cart', cart, product FROM funnel UNION ALL
-    SELECT 5, 'checkout', checkout, cart FROM funnel
+steps AS (
+    SELECT step, stage, customers
+    FROM funnel
+    CROSS JOIN UNNEST(
+        ARRAY[1, 2, 3, 4, 5],
+        ARRAY['home', 'category', 'product', 'cart', 'checkout'],
+        ARRAY[home, category, product, cart, checkout]
+    ) AS t(step, stage, customers)
 )
 SELECT
     step,
     stage,
     customers,
-    ROUND(customers * 1.0 / NULLIF(prev, 0), 4) AS step_retention,
-    ROUND(customers * 1.0 / NULLIF((SELECT home FROM funnel), 0), 4) AS overall_retention
-FROM stages
+    ROUND(customers * 1.0 / NULLIF(LAG(customers) OVER (ORDER BY step), 0), 4) AS step_retention,
+    ROUND(customers * 1.0 / NULLIF(FIRST_VALUE(customers) OVER (ORDER BY step), 0), 4) AS overall_retention
+FROM steps
 ORDER BY step;
